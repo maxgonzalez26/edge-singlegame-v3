@@ -14,8 +14,11 @@ import time
 import urllib.request
 import os
 import re
+import asyncio
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
+
+import websockets
 
 PORT = 8902
 STATE_FILE = "/tmp/singlegame_8902_state.json"
@@ -92,6 +95,150 @@ CODE_KEYWORDS = {
 
 # Also handle short 3-letter codes that might appear in PM outcomes
 CODE_EXACT = {k: k for k in CODE_KEYWORDS}  # "LAL" → "LAL"
+
+# ---------------------------------------------------------------------------
+# Polymarket WebSocket Price Stream
+# ---------------------------------------------------------------------------
+PM_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+class PMPriceStream:
+    """
+    Connects to Polymarket CLOB WebSocket and caches real-time best bid/ask.
+    Runs in its own thread with its own asyncio loop.
+    Thread-safe: read pm_stream.prices[token_id] from anywhere.
+    """
+
+    def __init__(self):
+        self.prices = {}  # token_id → {"bid": float, "ask": float, "ts": float}
+        self.token_map = {}  # token_id → team_name
+        self.connected = False
+        self.error = None
+        self.last_update = 0
+        self._token_ids = []
+        self._thread = None
+        self._running = False
+
+    def start(self, token_ids, outcome_names):
+        """Start WS connection for given tokens. Kills any existing connection."""
+        self.stop()
+        self._token_ids = token_ids
+        self.token_map = dict(zip(token_ids, outcome_names))
+        self.prices = {}
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop the WS connection."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self.connected = False
+
+    def _run_loop(self):
+        """Run asyncio event loop in this thread."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._ws_loop())
+        except Exception:
+            pass
+        finally:
+            loop.close()
+
+    async def _ws_loop(self):
+        """Connect to WS, subscribe, and process messages."""
+        while self._running:
+            try:
+                async with websockets.connect(PM_WS_URL) as ws:
+                    self.connected = True
+                    self.error = None
+                    sub = {
+                        "assets_ids": self._token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }
+                    await ws.send(json.dumps(sub))
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        self._parse(raw)
+
+            except Exception as e:
+                self.connected = False
+                self.error = str(e)
+                if self._running:
+                    await asyncio.sleep(2)
+
+    def _parse(self, raw):
+        """Parse WS message and update prices cache."""
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return
+
+        now = time.time()
+        for msg in data:
+            if not isinstance(msg, dict):
+                continue
+            ev = msg.get("event_type")
+            asset = msg.get("asset_id", "")
+
+            if asset not in self._token_ids:
+                continue
+
+            if ev == "book":
+                bids = msg.get("bids", [])
+                asks = msg.get("asks", [])
+                self.prices[asset] = {
+                    "bid": float(bids[0]["price"]) if bids else 0,
+                    "ask": float(asks[0]["price"]) if asks else 1,
+                    "ts": now,
+                }
+                self.last_update = now
+
+            elif ev == "best_bid_ask":
+                self.prices[asset] = {
+                    "bid": float(msg.get("best_bid", 0)),
+                    "ask": float(msg.get("best_ask", 1)),
+                    "ts": now,
+                }
+                self.last_update = now
+
+            elif ev == "price_change":
+                for ch in msg.get("price_changes", []):
+                    ch_asset = ch.get("asset_id", "")
+                    if ch_asset in self._token_ids:
+                        self.prices[ch_asset] = {
+                            "bid": float(ch.get("best_bid", 0)),
+                            "ask": float(ch.get("best_ask", 1)),
+                            "ts": now,
+                        }
+                        self.last_update = now
+
+    def get_team_prices(self):
+        """Return prices dict keyed by team name: {"Hawks": {"bid":..,"ask":..}, ...}"""
+        result = {}
+        for token_id, team in self.token_map.items():
+            if token_id in self.prices:
+                p = self.prices[token_id]
+                bid = p["bid"]
+                ask = p["ask"]
+                # Skip placeholder prices (0.01/0.99 is initial book)
+                if bid > 0.02 and ask < 0.98:
+                    result[team] = {"bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 4)}
+        return result
+
+
+# Global stream instance
+pm_stream = PMPriceStream()
 
 
 def load_state():
@@ -235,7 +382,8 @@ def fetch_ks_games():
 
 def fetch_pm_detail(slug):
     """
-    Get PM prices for BOTH tokens using CLOB midpoint.
+    Get PM prices for both tokens.
+    Prefers WebSocket stream (real-time), falls back to CLOB midpoint polling.
     Returns prices keyed by actual team outcome names.
     """
     global PM_TOKENS, PM_OUTCOMES
@@ -262,10 +410,29 @@ def fetch_pm_detail(slug):
     if slug not in PM_TOKENS:
         return None, None
 
-    # Fetch midpoints for BOTH tokens
+    teams = PM_OUTCOMES.get(slug, ["Team_0","Team_1"])
+
+    # Try WebSocket prices first (real-time, no API call)
+    ws_prices = pm_stream.get_team_prices()
+    if len(ws_prices) >= 2:
+        prices = {}
+        for team in teams:
+            if team in ws_prices:
+                wp = ws_prices[team]
+                prices[team] = {"price": wp["mid"], "bid": wp["bid"], "ask": wp["ask"]}
+        if len(prices) >= 2:
+            return {
+                "q": " vs. ".join(teams),
+                "teams": teams,
+                "prices": prices,
+                "vol": 0,
+                "source": "websocket",
+            }, teams
+
+    # Fallback: fetch midpoints for BOTH tokens via REST
     prices = {}
     for i, token_id in enumerate(PM_TOKENS[slug]):
-        team = PM_OUTCOMES.get(slug, ["Team_0","Team_1"])[i]
+        team = teams[i]
         url = "https://clob.polymarket.com/midpoint?token_id=" + token_id
         try:
             req = urllib.request.Request(url, headers={"User-Agent":"EdgeTrader/1.0"})
@@ -279,13 +446,13 @@ def fetch_pm_detail(slug):
     if len(prices) < 2:
         return None, None
 
-    teams = list(prices.keys())
     return {
         "q": " vs. ".join(teams),
         "teams": teams,
         "prices": prices,
         "vol": 0,
-    }, PM_OUTCOMES.get(slug, teams)
+        "source": "rest_poll",
+    }, teams
 
 
 def _code_for_outcome(outcome_name, ks_code):
@@ -551,8 +718,12 @@ def game_poller():
                     "team_a":ks_other,"team_b":ks_team,
                     "aa":arb.get("a",{}).get("p"),"ab":arb.get("b",{}).get("p"),"trades":len(nt)})
                 if len(live["history"])>500: live["history"]=live["history"][-500:]
+                # Show data source in error field (for debugging)
+                src = (pm_detail or {}).get("source", "?")
+                live["ws_connected"] = pm_stream.connected
+                live["data_source"] = src
             except Exception as e: live["error"]=str(e)
-        time.sleep(3)
+        time.sleep(1)  # Kalshi polls every 1s (PM is real-time via WebSocket)
 
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
@@ -791,6 +962,37 @@ def build_arb():
         '<script>setTimeout(function(){location.reload()},3000)</script></body></html>')
 
 
+# ─── WebSocket Startup ─────────────────────────────────────────────────────────
+def _start_pm_ws(pm_slug):
+    """Fetch token IDs for a slug and start the PM WebSocket stream."""
+    global PM_TOKENS, PM_OUTCOMES
+
+    # Get tokens + outcomes from Gamma (cached or fresh)
+    if pm_slug not in PM_TOKENS:
+        url = "https://gamma-api.polymarket.com/markets?slug=" + pm_slug
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "EdgeTrader/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                markets = data if isinstance(data, list) else data.get("markets", [])
+                for m in markets:
+                    tokens = m.get("clobTokenIds", "[]")
+                    if isinstance(tokens, str): tokens = json.loads(tokens)
+                    outcomes = m.get("outcomes", "[]")
+                    if isinstance(outcomes, str): outcomes = json.loads(outcomes)
+                    if len(tokens) == 2:
+                        PM_TOKENS[pm_slug] = tokens
+                        PM_OUTCOMES[pm_slug] = outcomes
+                        break
+        except:
+            pass
+
+    if pm_slug in PM_TOKENS:
+        tokens = PM_TOKENS[pm_slug]
+        outcomes = PM_OUTCOMES[pm_slug]
+        pm_stream.start(tokens, outcomes)
+
+
 # ─── Handler ──────────────────────────────────────────────────────────────────
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -813,6 +1015,8 @@ class H(http.server.BaseHTTPRequestHandler):
             live["poll_count"]=0
             state["last_ev"]={"a":0.0,"b":0.0}; state["streak_ev"]={"a":0.0,"b":0.0}
             state["streak_count"]={"a":0,"b":0}
+            # Start PM WebSocket for this game
+            _start_pm_ws(pm_slug)
             save_state()
             self.send_response(302); self.send_header("Location","/arb"); self.end_headers(); return
 

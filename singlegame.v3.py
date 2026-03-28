@@ -9,6 +9,7 @@ Port 8902.
 import http.server
 import socketserver
 import json
+import logging
 import threading
 import time
 import urllib.request
@@ -19,6 +20,9 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import websockets
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("v3")
 
 PORT = 8902
 STATE_FILE = "/tmp/singlegame_8902_state.json"
@@ -287,9 +291,16 @@ def _is_expired(date_str):
     if not date_str: return False
     try:
         s = date_str.strip()
-        # Date-only: "2026-03-27" → treat as end of day so today's games are kept
         if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
-            dt = datetime.fromisoformat(s).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+            # Date-only: treat as end of day EDT (UTC-4), not UTC
+            # So "2026-03-27" expires at 2026-03-28 03:59:59 UTC
+            from datetime import timedelta
+            dt = datetime.fromisoformat(s).replace(
+                hour=23, minute=59, second=59,
+                tzinfo=timezone(timedelta(hours=-4))  # EDT
+            )
+            # Convert to UTC for comparison
+            dt = dt.astimezone(timezone.utc)
         else:
             dt = datetime.fromisoformat(s.replace("Z","+00:00"))
         return dt < datetime.now(timezone.utc)
@@ -299,30 +310,50 @@ def _is_expired(date_str):
 
 # ─── Fetchers ─────────────────────────────────────────────────────────────────
 def fetch_pm_games():
-    """Scan Polymarket for NBA games only. Filter out finished."""
+    """Scan Polymarket for NBA games using Gamma API. More reliable than web scraping."""
     games = []
-    url = "https://polymarket.com/sports/nba"
-    pattern = r'nba-[a-z]{2,5}-[a-z]{2,5}-\d{4}-\d{2}-\d{2}'
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8",errors="ignore")
-            for slug in set(re.findall(pattern, html)):
-                m = re.match(r'nba-([a-z]+)-([a-z]+)-(\d{4}-\d{2}-\d{2})', slug)
-                if m:
-                    away = m.group(1).upper(); home = m.group(2).upper(); date = m.group(3)
-                    # Skip if game date is in the past
-                    if _is_expired(date + "T23:59:59Z"):
+    _seen = set()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for order in ["volume24hr", "volume", "liquidity"]:
+        for page_offset in [0, 100]:
+            url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={page_offset}&order={order}&ascending=false"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                    markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+                if not markets:
+                    break
+                for m in markets:
+                    slug = m.get("slug", "")
+                    if not slug.startswith("nba-"):
                         continue
-                    away_n = TEAM_NAMES.get(away, away.title())
-                    home_n = TEAM_NAMES.get(home, home.title())
-                    dp = date.split("-")
-                    dd = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
-                          "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"
-                          }.get(dp[1] if len(dp)>1 else "","") + " " + str(int(dp[2])) if len(dp)==3 else date
-                    games.append({"title":away_n+" @ "+home_n,"pm_slug":slug,"sport":"NBA","date_display":dd})
-    except Exception as e:
-        pass
+                    if "-spread-" in slug or "-total-" in slug:
+                        continue
+                    if slug in _seen:
+                        continue
+                    end_date = m.get("endDate", "")
+                    if _is_expired(end_date):
+                        continue
+                    _seen.add(slug)
+                    match = re.match(r'nba-([a-z]+)-([a-z]+)-(\d{4}-\d{2}-\d{2})', slug)
+                    if match:
+                        away_code = match.group(1).upper()
+                        home_code = match.group(2).upper()
+                        date = match.group(3)
+                        away_n = TEAM_NAMES.get(away_code, away_code.title())
+                        home_n = TEAM_NAMES.get(home_code, home_code.title())
+                        dp = date.split("-")
+                        month_names = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
+                                      "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"}
+                        dd = month_names.get(dp[1] if len(dp)>1 else "", "") + " " + str(int(dp[2])) if len(dp)==3 else date
+                        games.append({"title": away_n + " @ " + home_n, "pm_slug": slug, "sport": "NBA", "date_display": dd})
+            except Exception as e:
+                pass
+            time.sleep(0.3)
+
+    log.info(f"PM scan: found {len(games)} NBA games")
     return games
 
 
@@ -333,14 +364,14 @@ def fetch_ks_games():
     base = "https://api.elections.kalshi.com/trade-api/v2"
     series = "KXNBAGAME"
     try:
-        url = base + "/events?series_ticker=" + series + "&limit=50"
+        url = base + "/events?series_ticker=" + series + "&limit=100"
         req = urllib.request.Request(url, headers={"User-Agent":"EdgeTrader/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             events = json.loads(resp.read()).get("events",[])
-            for ev in events[:20]:
+            for ev in events[:15]:
                 et = ev.get("event_ticker","")
                 if not et: continue
-                time.sleep(1.5)
+                time.sleep(0.5)
                 try:
                     mreq = urllib.request.Request(base+"/markets?event_ticker="+et+"&limit=5", headers={"User-Agent":"ET"})
                     with urllib.request.urlopen(mreq, timeout=8) as mresp:
@@ -375,7 +406,7 @@ def fetch_ks_games():
                                         _seen.add(sk)
                                         games.append({"title":display,"ticker":ticker,"sport":"NBA","date_display":dd})
                 except Exception as e:
-                    if "429" in str(e): time.sleep(8)
+                    if "429" in str(e): time.sleep(3)
     except: pass
     return games
 
@@ -685,11 +716,16 @@ def place_trade(arb):
 def game_scanner():
     while True:
         try:
-            live["games"] = fetch_pm_games() + fetch_ks_games()
+            pm = fetch_pm_games()
+            ks = fetch_ks_games()
+            live["games"] = pm + ks
             live["last_scan"] = datetime.now().strftime("%H:%M:%S")
             live["scan_count"] = live.get("scan_count",0) + 1
-        except Exception as e: live["error"]=str(e)
-        time.sleep(60)
+            log.info(f"Scanner: {len(pm)} PM + {len(ks)} KS = {len(pm)+len(ks)} total games")
+        except Exception as e:
+            live["error"]=str(e)
+            log.error(f"Scanner error: {e}")
+        time.sleep(30)  # scan every 30 seconds
 
 
 def game_poller():

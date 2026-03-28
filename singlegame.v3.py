@@ -24,7 +24,7 @@ import websockets
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("v3")
 
-PORT = 8902
+PORT = int(os.environ.get("PORT", 8902))
 STATE_FILE = "/tmp/singlegame_8902_state.json"
 INITIAL_BANKROLL = 1000.00
 MAX_BET = 20.00

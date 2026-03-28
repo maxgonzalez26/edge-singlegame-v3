@@ -313,7 +313,7 @@ def fetch_pm_games():
     """Scan Polymarket for NBA games using Gamma API. More reliable than web scraping."""
     games = []
     _seen = set()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    TODAY = "2026-03-27"  # only pull today's games
 
     for order in ["volume24hr", "volume", "liquidity"]:
         for page_offset in [0, 100]:
@@ -333,16 +333,12 @@ def fetch_pm_games():
                         continue
                     if slug in _seen:
                         continue
-                    # Skip expired — use endDate only if game is actually closed
-                    end_date = m.get("endDate", "")
+                    # Only today's games
+                    if TODAY not in slug:
+                        continue
                     is_closed = m.get("closed", False)
                     if is_closed:
                         continue
-                    # Only apply date-based expiry for date-only strings (not full timestamps)
-                    # Full timestamps are game start times, not resolution times
-                    if end_date and re.match(r'^\d{4}-\d{2}-\d{2}$', end_date.strip()):
-                        if _is_expired(end_date):
-                            continue
                     _seen.add(slug)
                     match = re.match(r'nba-([a-z]+)-([a-z]+)-(\d{4}-\d{2}-\d{2})', slug)
                     if match:
@@ -360,16 +356,17 @@ def fetch_pm_games():
                 pass
             time.sleep(0.3)
 
-    log.info(f"PM scan: found {len(games)} NBA games")
+    log.info(f"PM scan: found {len(games)} NBA games ({TODAY})")
     return games
 
 
 def fetch_ks_games():
-    """Scan Kalshi for NBA games only. Filter out finished."""
+    """Scan Kalshi for NBA games only. Filter to today's games."""
     games = []
     _seen = set()
     base = "https://api.elections.kalshi.com/trade-api/v2"
     series = "KXNBAGAME"
+    TODAY = "2026-03-27"
     try:
         url = base + "/events?series_ticker=" + series + "&limit=100"
         req = urllib.request.Request(url, headers={"User-Agent":"EdgeTrader/1.0"})
@@ -408,9 +405,13 @@ def fetch_ks_games():
                                                      "NOV":"11","DEC":"12"}
                                         dd = month_names.get(month_code, "") + " " + str(int(day))
                                         game_date = year + "-" + month_num.get(month_code, "01") + "-" + day
-                                    # Skip expired
-                                    if game_date and _is_expired(game_date + "T23:59:59Z"):
+                                    # Only today's games
+                                    if game_date != TODAY:
                                         continue
+                                    sk = "ks:NBA:"+home+":"+away+":"+dd
+                                    if sk not in _seen:
+                                        _seen.add(sk)
+                                        games.append({"title":display,"ticker":ticker,"sport":"NBA","date_display":dd})
                                     sk = "ks:NBA:"+home+":"+away+":"+dd
                                     if sk not in _seen:
                                         _seen.add(sk)

@@ -375,7 +375,7 @@ def fetch_ks_games():
         req = urllib.request.Request(url, headers={"User-Agent":"EdgeTrader/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             events = json.loads(resp.read()).get("events",[])
-            for ev in events[:15]:
+            for ev in events[:30]:
                 et = ev.get("event_ticker","")
                 if not et: continue
                 time.sleep(0.5)
@@ -391,20 +391,23 @@ def fetch_ks_games():
                                     away = _normalize(pts[0]); home = _normalize(pts[1])
                                     display = away + " @ " + home
                                     ticker = m.get("ticker","")
-                                    # Extract date from ticker
-                                    dm = re.search(r'-(\d{2})([A-Z]{3})(\d{2})', ticker.upper())
+                                    # Extract date from ticker — date is after series prefix
+                                    # Format: KXNBAGAME-26MAR27BKNLAL-BKN → date = 26MAR27
+                                    dm = re.search(r'KXNBAGAME-(\d{2})([A-Z]{3})(\d{2})', ticker.upper())
                                     dd = ""
                                     game_date = None
                                     if dm:
-                                        ma = {"JAN":"Jan","FEB":"Feb","MAR":"Mar","APR":"Apr","MAY":"May",
-                                              "JUN":"Jun","JUL":"Jul","AUG":"Aug","SEP":"Sep","OCT":"Oct",
-                                              "NOV":"Nov","DEC":"Dec"}
-                                        dd = ma.get(dm.group(2),"") + " " + str(int(dm.group(3)))
-                                        # Build ISO date for expiry check
+                                        year = "20" + dm.group(1)
+                                        month_code = dm.group(2)
+                                        day = dm.group(3)
+                                        month_names = {"JAN":"Jan","FEB":"Feb","MAR":"Mar","APR":"Apr","MAY":"May",
+                                                      "JUN":"Jun","JUL":"Jul","AUG":"Aug","SEP":"Sep","OCT":"Oct",
+                                                      "NOV":"Nov","DEC":"Dec"}
                                         month_num = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05",
                                                      "JUN":"06","JUL":"07","AUG":"08","SEP":"09","OCT":"10",
-                                                     "NOV":"11","DEC":"12"}.get(dm.group(2),"01")
-                                        game_date = "20" + dm.group(3) + "-" + month_num + "-" + dm.group(1)
+                                                     "NOV":"11","DEC":"12"}
+                                        dd = month_names.get(month_code, "") + " " + str(int(day))
+                                        game_date = year + "-" + month_num.get(month_code, "01") + "-" + day
                                     # Skip expired
                                     if game_date and _is_expired(game_date + "T23:59:59Z"):
                                         continue

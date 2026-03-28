@@ -333,9 +333,16 @@ def fetch_pm_games():
                         continue
                     if slug in _seen:
                         continue
+                    # Skip expired — use endDate only if game is actually closed
                     end_date = m.get("endDate", "")
-                    if _is_expired(end_date):
+                    is_closed = m.get("closed", False)
+                    if is_closed:
                         continue
+                    # Only apply date-based expiry for date-only strings (not full timestamps)
+                    # Full timestamps are game start times, not resolution times
+                    if end_date and re.match(r'^\d{4}-\d{2}-\d{2}$', end_date.strip()):
+                        if _is_expired(end_date):
+                            continue
                     _seen.add(slug)
                     match = re.match(r'nba-([a-z]+)-([a-z]+)-(\d{4}-\d{2}-\d{2})', slug)
                     if match:
